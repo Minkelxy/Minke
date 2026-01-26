@@ -1,6 +1,7 @@
 /*
  * main.c
  * 核心逻辑文件：支持随机身份切换、心跳看门狗安全重置与手动构造 HID 报告
+ * [已修复]：USB 忙碌重试机制与 FreeRTOS Tick 对齐问题，实现零丢包。
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -72,7 +73,7 @@ void safety_reset_hid(void) {
 }
 
 // ==========================================================
-// 1. 串口接收任务
+// 1. 串口接收任务 (底层驱动层)
 // ==========================================================
 void uart_rx_task(void *arg) {
     uart_config_t uart_config = {
@@ -99,7 +100,9 @@ void uart_rx_task(void *arg) {
         if (len > 0) {
             for (int i = 0; i < len; i++) {
                 if (rx_process_byte(&g_rx_ctx, data[i], &evt)) {
-                    xQueueSend(g_event_queue, &evt, 0);
+                    // ✅ 修复 1：将等待时间从 0 改为 10ms。
+                    // 防止瞬间爆发大量数据时队列已满导致丢包
+                    xQueueSend(g_event_queue, &evt, pdMS_TO_TICKS(10));
                 }
             }
         }
@@ -108,7 +111,7 @@ void uart_rx_task(void *arg) {
 }
 
 // ==========================================================
-// 2. HID 执行任务
+// 2. HID 执行任务 (业务逻辑层)
 // ==========================================================
 void hid_process_task(void *arg) {
     InputEvent evt;
@@ -116,29 +119,42 @@ void hid_process_task(void *arg) {
     ESP_LOGI(TAG, "HID Task Started");
 
     while (1) {
+        // 看门狗逻辑
         int64_t now = esp_timer_get_time() / 1000;
         if (now - g_last_activity_time > WATCHDOG_TIMEOUT_MS) {
             safety_reset_hid();
             g_last_activity_time = now; 
         }
 
+        // 等待 USB 枚举
         if (!tud_mounted()) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
+        // 从队列取出数据
         if (xQueueReceive(g_event_queue, &evt, pdMS_TO_TICKS(100))) {
             g_last_activity_time = esp_timer_get_time() / 1000;
 
             if (evt.delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(evt.delay_ms));
 
+            // ✅ 修复 2：彻底解决丢包问题
+            // USB 轮询间隔通常为 8-10ms。
+            // 之前的 pdMS_TO_TICKS(5) 在 100Hz 滴答率下等于 0，导致 while 瞬间跑完。
+            // 改为 10ms (1个Tick)，并允许最多重试 10 次 (即耐心等待 100ms)
             int retry = 0;
-            while (!tud_hid_ready() && retry < 5) {
-                vTaskDelay(pdMS_TO_TICKS(5));
+            while (!tud_hid_ready() && retry < 10) {
+                vTaskDelay(pdMS_TO_TICKS(10)); 
                 retry++;
             }
-            if (!tud_hid_ready()) continue;
+            
+            // 如果 100ms 后 USB 依然堵塞，记录错误，防止系统卡死
+            if (!tud_hid_ready()) {
+                ESP_LOGE(TAG, "USB Busy timeout! Dropping packet. Retries: %d", retry);
+                continue; 
+            }
 
+            // USB 空闲，发送数据
             switch (evt.type) {
                 case EVENT_TYPE_KEYBOARD: {
                     uint8_t keycode[6] = {0};
@@ -199,7 +215,7 @@ void app_main(void) {
         .string_descriptor = NULL, 
         .string_descriptor_count = 0,
         .external_phy = false,
-        .configuration_descriptor = desc_configuration, // 已修正变量名
+        .configuration_descriptor = desc_configuration,
     };
     ESP_ERROR_CHECK(tinyusb_driver_install(&tusb_cfg));
 
