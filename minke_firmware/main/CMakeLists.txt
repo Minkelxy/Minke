@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS 
+        "main.c"
+        "protocol/uart_protocol.c"
+        "usb/usb_descriptors.c"
+    INCLUDE_DIRS 
+        "."
+        "protocol"
+        "usb"
+)

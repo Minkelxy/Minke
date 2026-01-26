@@ -1,9 +1,8 @@
 # 🐋 Minke
 
-**Minke Is Not Keyboard Emulator.**
+**Minke Is Nesting Key Events.**
 
-
-> **"深海潜行，静默执行。" (Deep dive, silent execution.)**
+> **"它安静如深海鳁鲸，却能在你按下回车的瞬间，替你掀起巨浪。"**
 
 Minke 是一个基于 **ESP32-S3** 的微型自动化引擎。它通过 USB HID 协议将 ESP32 伪装成标准的物理键鼠设备，并通过串口（UART）接收上位机指令。
 
