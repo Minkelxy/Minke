@@ -1,3 +1,4 @@
+// src/human.rs
 use crate::InputDevice;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,7 +13,7 @@ pub struct HumanDriver {
 }
 
 impl HumanDriver {
-    /// 初始化拟人化驱动器，建议传入当前真实的鼠标坐标
+    /// 初始化拟人化驱动器
     pub fn new(device: Arc<Mutex<InputDevice>>, start_x: u16, start_y: u16) -> Self {
         Self {
             device,
@@ -21,121 +22,167 @@ impl HumanDriver {
         }
     }
 
+    // ==========================================
+    // 1. 基础输入原子操作 (原子层)
+    // ==========================================
+
+    /// 内部辅助：字符转 HID 键码
+    fn char_to_keycode(&self, ch: char) -> u8 {
+        match ch.to_ascii_lowercase() {
+            'a'..='z' => ch.to_ascii_lowercase() as u8 - b'a' + 0x04,
+            '1'..='9' => ch as u8 - b'1' + 0x1E,
+            '0' => 0x27,
+            ' ' => 0x2C,
+            _ => 0,
+        }
+    }
+
+    /// 🔥 【键盘长按】
+    /// 允许指定按下的毫秒数。如果是 0，则执行一次极短的点击。
+    pub fn key_hold(&mut self, ch: char, ms: u64) {
+        let keycode = self.char_to_keycode(ch);
+        if keycode != 0 {
+            if let Ok(mut dev) = self.device.lock() {
+                dev.key_down(keycode, 0);
+            }
+            
+            // 如果 ms 为 0，模拟一个非常短的物理接触
+            let hold_time = if ms > 0 { ms } else { rand::thread_rng().gen_range(20..45) };
+            thread::sleep(Duration::from_millis(hold_time));
+
+            if let Ok(mut dev) = self.device.lock() {
+                dev.key_up();
+            }
+        }
+    }
+
+    /// 【拟人化按键点击】 (短按)
+    pub fn key_click(&mut self, ch: char) {
+        // 模拟真实按键点击通常在 30-70ms 之间
+        let jitter = rand::thread_rng().gen_range(35..70);
+        self.key_hold(ch, jitter);
+    }
+
+    /// 🔥 【模拟鼠标滚轮】
+    /// delta: 120 的倍数，正数为向上滚，负数为向下滚
+    pub fn mouse_scroll(&mut self, delta: i32) {
+        if let Ok(mut dev) = self.device.lock() {
+            // 在 lib.rs 中 mouse_move 的第三个参数通常对应滚轮字节
+            dev.mouse_move(0, 0, delta as i8);
+        }
+        // 滚轮后稍微停顿符合人体工程学
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    /// 🔥 【相对移动】
+    /// 用于在当前位置基础上进行微调或防掉线微动
+    pub fn move_relative(&mut self, dx: i32, dy: i32) {
+        if let Ok(mut dev) = self.device.lock() {
+            dev.mouse_move(dx, dy, 0);
+        }
+        self.cur_x += dx as f32;
+        self.cur_y += dy as f32;
+    }
+
+    // ==========================================
+    // 2. 高级拟人化行为 (行为层)
+    // ==========================================
+
     /// 【高级拟人移动】
-    /// 包含：三次贝塞尔曲线、三次缓动加速、随机过冲和落点抖动
     pub fn move_to_humanly(&mut self, target_x: u16, target_y: u16, duration_sec: f32) {
         let mut rng = rand::thread_rng();
         let start = (self.cur_x, self.cur_y);
         
-        // 1. 落点抖动 (Jitter)：人手点击不会每次都在同一个像素点
-        // 模拟 1-3 像素的随机偏差，呈现正态分布感
         let end = (
             target_x as f32 + rng.gen_range(-2.0..2.0),
             target_y as f32 + rng.gen_range(-2.0..2.0)
         );
 
-        // 2. 随机生成两个控制点
-        // 控制点 1：靠近起点，决定起步弧度
         let ctrl1 = (
             start.0 + (end.0 - start.0) * 0.2 + rng.gen_range(-40.0..40.0),
             start.1 + (end.1 - start.1) * 0.2 + rng.gen_range(-40.0..40.0)
         );
-        // 控制点 2：靠近终点，通过加大随机范围模拟惯性带来的“过冲”潜力
         let ctrl2 = (
             start.0 + (end.0 - start.0) * 0.8 + rng.gen_range(-20.0..60.0),
             start.1 + (end.1 - start.1) * 0.8 + rng.gen_range(-20.0..60.0)
         );
 
-        // 3. 计算步数 (建议 60-100Hz，符合主流采样率)
         let steps = (duration_sec * 80.0) as u32; 
         let interval = Duration::from_secs_f32(duration_sec / steps as f32);
 
         for i in 0..=steps {
-            // 4. 三次缓动加速 (Ease-in-out)：慢-快-慢，符合人体力学
             let t_linear = i as f32 / steps as f32;
             let t_eased = Self::ease_in_out_cubic(t_linear);
-
             let (px, py) = Self::bezier_cubic(t_eased, start, ctrl1, ctrl2, end);
             
             if let Ok(mut dev) = self.device.lock() {
-                // 调用 lib.rs 里的 mouse_abs 发送绝对坐标
                 dev.mouse_abs(px as u16, py as u16);
             }
             thread::sleep(interval);
         }
 
-        // 更新当前记录位置
         self.cur_x = end.0;
         self.cur_y = end.1;
     }
 
-    /// 【拟人化点击】
-    /// 模拟真实手指按压时间 (带有小幅随机波动)
-    pub fn click_humanly(&mut self, left: bool, right: bool) {
+    /// 【拟人化鼠标点击】
+    /// 增加 hold_ms 参数以支持长按点击（如蓄力）
+    pub fn click_humanly(&mut self, left: bool, right: bool, hold_ms: u64) {
         let mut rng = rand::thread_rng();
         if let Ok(mut dev) = self.device.lock() {
             dev.mouse_down(left, right);
-            // 模拟按下去的瞬间停顿：30ms-70ms 之间
-            thread::sleep(Duration::from_millis(rng.gen_range(30..75)));
+            
+            let sleep_time = if hold_ms > 0 { hold_ms } else { rng.gen_range(30..75) };
+            thread::sleep(Duration::from_millis(sleep_time));
+            
             dev.mouse_up();
         }
     }
 
+    pub fn double_click_humanly(&mut self, left: bool, right: bool) {
+        let mut rng = rand::thread_rng();
+        
+        // 第一次点击
+        self.click_humanly(left, right, 0);
+        
+        // 两次点击之间的关键间隔：拟人化的短促停顿 (通常 40-90ms 是双击的黄金时间)
+        let interval = rng.gen_range(40..85);
+        thread::sleep(Duration::from_millis(interval));
+        
+        // 第二次点击
+        self.click_humanly(left, right, 0);
+    }
+
     /// 【拟人化打字】
-    /// 模拟 WPM 语速，并引入基于正态分布的按键间隔抖动
     pub fn type_humanly(&mut self, text: &str, base_wpm: f32) {
-        // 计算基础延迟 (WPM 转为平均延迟)
         let base_delay_ms = 60.0 / (base_wpm * 5.0) * 1000.0;
-        // 构造标准差为 30% 的正态分布，模拟手指长短和熟练度带来的差异
         let normal_dist = Normal::new(base_delay_ms, base_delay_ms * 0.3).unwrap();
         let mut rng = rand::thread_rng();
 
         for ch in text.chars() {
-            let keycode = match ch.to_ascii_lowercase() {
-                'a'..='z' => ch.to_ascii_lowercase() as u8 - b'a' + 0x04,
-                ' ' => 0x2C,
-                _ => 0,
-            };
+            // 直接复用我们新写的 key_click
+            self.key_click(ch);
 
-            if keycode != 0 {
-                if let Ok(mut dev) = self.device.lock() {
-                    dev.key_down(keycode, 0);
-                    // 模拟按键按住的物理时长
-                    thread::sleep(Duration::from_millis(rng.gen_range(25..60)));
-                    dev.key_up();
-                }
-            }
-
-            // 执行基于正态分布的随机停顿
+            // 字符间的随机停顿
             let delay = normal_dist.sample(&mut rng).max(10.0) as u64;
             thread::sleep(Duration::from_millis(delay));
         }
     }
 
     // ==========================================
-    // 数学辅助函数
+    // 3. 数学辅助函数 (数学层)
     // ==========================================
 
-    /// 三次缓动函数实现
     fn ease_in_out_cubic(t: f32) -> f32 {
-        if t < 0.5 {
-            4.0 * t * t * t
-        } else {
-            1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
-        }
+        if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
     }
 
-    /// 三次贝塞尔曲线公式实现
-    /// P = (1-t)^3*P0 + 3*t*(1-t)^2*P1 + 3*t^2*(1-t)*P2 + t^3*P3
     fn bezier_cubic(t: f32, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)) -> (f32, f32) {
         let u = 1.0 - t;
         let tt = t * t;
         let uu = u * u;
-        let uuu = uu * u;
-        let ttt = tt * t;
-
-        let x = uuu * p0.0 + 3.0 * uu * t * p1.0 + 3.0 * u * tt * p2.0 + ttt * p3.0;
-        let y = uuu * p0.1 + 3.0 * uu * t * p1.1 + 3.0 * u * tt * p2.1 + ttt * p3.1;
+        let x = uu * u * p0.0 + 3.0 * uu * t * p1.0 + 3.0 * u * tt * p2.0 + tt * t * p3.0;
+        let y = uu * u * p0.1 + 3.0 * uu * t * p1.1 + 3.0 * u * tt * p2.1 + tt * t * p3.1;
         (x, y)
     }
 }

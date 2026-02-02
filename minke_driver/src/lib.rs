@@ -1,3 +1,6 @@
+// src/lib.rs
+
+// 公开子模块
 pub mod human;
 
 use byteorder::{LittleEndian, WriteBytesExt};
